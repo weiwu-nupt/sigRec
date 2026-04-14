@@ -204,6 +204,7 @@ PARSER_REGISTRY: dict[str, IQParser] = {
     "signalhound_dvb": SignalHoundParser(),
     "5g_nr":           NR5GParser(),
     "4g_lte":          LTE4GParser(),
+    # "iqhb" 由 iqhb_parser.py 插件在模块加载时自动注册
 }
 
 
@@ -223,6 +224,13 @@ def detect_format(meta_path: str) -> IQParser:
 
     if ext in (".json", ".sigmf-meta"):
         return PARSER_REGISTRY["5g_nr"]
+
+    if ext == ".iqh":
+        if "iqhb" not in PARSER_REGISTRY:
+            raise ValueError(
+                ".iqh 格式需要 iqhb_parser.py 插件，请确保该文件与本脚本在同一目录"
+            )
+        return PARSER_REGISTRY["iqhb"]
 
     raise ValueError(f"无法识别文件格式: {meta_path}")
 
@@ -325,6 +333,40 @@ def save_spectrogram_image(
 
 
 # ─────────────────────────────────────────────
+# 自适应 nfft 计算
+# ─────────────────────────────────────────────
+
+def auto_nfft(sample_rate: float) -> int:
+    """
+    根据采样率自适应选择 nfft，保证时频图有合理的时频分辨率。
+
+    策略：目标时间分辨率约 0.1ms，nfft 向上取最近的 2 的幂次。
+    同时限制在 [64, 2048] 范围内。
+
+    采样率对应关系示例：
+      1.5625 MHz (GSM)    → 64   (每帧 0.041ms)
+      6.25   MHz (LTE 3M) → 512  (每帧 0.082ms)
+      12.5   MHz (LTE 5M) → 1024 (每帧 0.082ms)
+      30.72  MHz (WiFi)   → 2048 (每帧 0.067ms)
+      61.44  MHz (DVB)    → 2048 (每帧 0.033ms)
+    """
+    # 目标：每帧约覆盖 0.05ms，确保时间轴有足够帧数（10ms窗口内至少200帧）
+    # 同时频率分辨率 = sample_rate / nfft，nfft越大频率越细
+    target_ms = 0.05
+    target_samples = sample_rate * target_ms / 1000.0
+
+    # 向上取最近的 2 的幂次
+    n = 1
+    while n < target_samples:
+        n <<= 1
+
+    nfft = max(64, min(2048, n))
+    log.info(f"  自适应 nfft: {nfft}  (采样率 {sample_rate/1e6:.3f} MHz)")
+    return nfft
+
+
+
+# ─────────────────────────────────────────────
 # 批量生成主函数
 # ─────────────────────────────────────────────
 
@@ -333,7 +375,7 @@ def process_file(
     output_dir: str,
     images_per_file: int = 10,
     img_size: Tuple[int, int] = (224, 224),
-    nfft: int = 256,
+    nfft: int = 0,   # 0 = 自适应
     overlap: float = 0.75,
     colormap: str = "viridis",
     iq_search_dirs: Optional[List[str]] = None,
@@ -349,6 +391,9 @@ def process_file(
 
     parser = detect_format(meta_path)
     meta = parser.parse(meta_path)
+
+    # nfft=0 表示自适应
+    actual_nfft = auto_nfft(meta.sample_rate) if nfft == 0 else nfft
 
     samples_10ms = meta.samples_per_10ms
     max_start = meta.sample_count - samples_10ms
@@ -379,7 +424,7 @@ def process_file(
             log.warning(f"  → 使用 PreviewTrace 模拟 IQ（仅供演示，精度有限）")
             iq = _simulate_iq_from_preview(meta_path, samples_10ms)
 
-        _, _, pdb = generate_spectrogram(iq, meta.sample_rate, nfft=nfft, overlap=overlap)
+        _, _, pdb = generate_spectrogram(iq, meta.sample_rate, nfft=actual_nfft, overlap=overlap)
 
         out_name = f"{global_start + idx + 1}.png"
         out_path = os.path.join(output_dir, out_name)
@@ -423,14 +468,15 @@ def _simulate_iq_from_preview(xml_path: str, n_samples: int) -> np.ndarray:
 # 目录扫描: 叶子目录 XML 自动发现
 # ─────────────────────────────────────────────
 
-def scan_leaf_dirs(root_dir: str, xml_ext: str = ".xml") -> List[str]:
+def scan_leaf_dirs(root_dir: str, xml_ext: str = ".xml", file_index: int = 1) -> List[str]:
     """
     遍历 root_dir，找出所有「最深叶子目录」（即不含任何子目录的目录），
-    每个叶子目录按文件名排序后取第一个 XML 文件。
+    每个叶子目录按文件名排序后取第 file_index 个 XML 文件（1-based）。
 
     参数:
-        root_dir : 根目录路径，例如 C:/Users/.../GSM/DCS1800/Downlink
-        xml_ext  : 元数据文件扩展名，默认 .xml
+        root_dir   : 根目录路径，例如 C:/Users/.../GSM/DCS1800/Downlink
+        xml_ext    : 元数据文件扩展名，默认 .xml
+        file_index : 取第几个文件，1=第一个，2=第二个，以此类推
 
     返回: XML 文件路径列表（每个叶子目录一个）
     """
@@ -455,9 +501,14 @@ def scan_leaf_dirs(root_dir: str, xml_ext: str = ".xml") -> List[str]:
             log.warning(f"叶子目录无 XML 文件，跳过: {dirpath}")
             continue
 
-        chosen = os.path.join(dirpath, xml_files[0])
+        idx = file_index - 1
+        if idx >= len(xml_files):
+            log.warning(f"  叶子目录 {dirpath} 只有 {len(xml_files)} 个 XML，"
+                        f"无法取第 {file_index} 个，改取最后一个")
+            idx = len(xml_files) - 1
+        chosen = os.path.join(dirpath, xml_files[idx])
         log.info(f"  叶子目录: {dirpath}")
-        log.info(f"    → 选取: {xml_files[0]}"
+        log.info(f"    → 选取第{file_index}个: {xml_files[idx]}"
                  + (f"  (共 {len(xml_files)} 个 XML)" if len(xml_files) > 1 else ""))
         result.append(chosen)
 
@@ -471,7 +522,7 @@ def batch_generate(
     output_dir: str,
     images_per_file: int = 10,
     img_size: Tuple[int, int] = (224, 224),
-    nfft: int = 256,
+    nfft: int = 0,   # 0 = 自适应
     overlap: float = 0.75,
     colormap: str = "viridis",
     iq_search_dirs: Optional[List[str]] = None,
@@ -530,7 +581,9 @@ def main():
     p.add_argument("--filelist",        default=None,
                    help="包含文件路径的 txt 文件，每行一个路径（与 --files 二选一）")
     p.add_argument("--scan_dir",        nargs="+", default=None,
-                   help="自动扫描目录：找出所有最深叶子目录，每个目录取第一个 XML 文件")
+                   help="自动扫描目录：找出所有最深叶子目录，每个目录取第N个 XML 文件")
+    p.add_argument("--scan_dir_index",  type=int, default=1,
+                   help="扫描目录时取叶子目录中第几个 XML 文件（1=第一个，2=第二个...）")
     p.add_argument("--output_dir",     default="./tfmap_output",
                    help="图像输出目录")
     p.add_argument("--images_per_file", type=int, default=10,
@@ -538,8 +591,8 @@ def main():
     p.add_argument("--img_size",       nargs=2, type=int, default=[224, 224],
                    metavar=("W", "H"),
                    help="输出图像尺寸 (宽 高)")
-    p.add_argument("--nfft",           type=int, default=256,
-                   help="STFT FFT 点数（时频分辨率权衡）")
+    p.add_argument("--nfft",           type=int, default=0,
+                   help="STFT FFT 点数；0=自适应（根据采样率自动选取，推荐）")
     p.add_argument("--overlap",        type=float, default=0.75,
                    help="STFT 帧重叠比例 [0, 1)")
     p.add_argument("--colormap",       default="viridis",
@@ -561,8 +614,8 @@ def main():
 
     if args.scan_dir:
         for root_dir in args.scan_dir:
-            found = scan_leaf_dirs(root_dir)
-            log.info(f"扫描 {root_dir} → 找到 {len(found)} 个叶子目录，共 {len(found)} 个 XML")
+            found = scan_leaf_dirs(root_dir, file_index=args.scan_dir_index)
+            log.info(f"扫描 {root_dir} → 找到 {len(found)} 个叶子目录，取第{args.scan_dir_index}个 XML")
             meta_paths.extend(found)
 
     if not meta_paths:
@@ -578,6 +631,40 @@ def main():
         colormap        = args.colormap,
         iq_search_dirs  = args.iq_dirs,
     )
+
+
+# ─────────────────────────────────────────────
+# 插件自动加载（与本文件同目录的解析器插件）
+# ─────────────────────────────────────────────
+
+def _load_plugins():
+    """
+    自动加载与本脚本同目录的解析器插件。
+    目前支持的插件：
+      iqhb_parser.py  → 注册 .iqh/.iqb 格式解析器
+    """
+    plugin_dir = Path(__file__).parent
+    plugins = [
+        ("iqhb_parser", "iqhb"),
+    ]
+    for module_name, key in plugins:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                module_name, plugin_dir / f"{module_name}.py"
+            )
+            if spec is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.register(PARSER_REGISTRY)
+            log.debug(f"插件已加载: {module_name} → '{key}'")
+        except FileNotFoundError:
+            pass   # 插件不存在时静默跳过
+        except Exception as e:
+            log.warning(f"插件加载失败 ({module_name}): {e}")
+
+_load_plugins()
 
 
 if __name__ == "__main__":

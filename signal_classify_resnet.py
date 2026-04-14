@@ -1,7 +1,10 @@
 """
 信号体制分类 —— ResNet 训练脚本
 支持类别：WiFi / 5G / 4G / DVB / GSM
-功能：训练 ResNet、绘制 Loss/Acc 曲线、绘制 t-SNE 特征分布图
+数据结构：
+    SigPic/train/<class>/xxx.png
+    SigPic/test/<class>/xxx.png
+功能：训练 ResNet、绘制 Loss/Acc 曲线、混淆矩阵（概率）、t-SNE 特征分布图
 """
 
 import os
@@ -9,7 +12,7 @@ import time
 import copy
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # 无显示器环境下保存图片
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
@@ -25,10 +28,11 @@ from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
 
 # ─────────────────────────────────────────────
-# 超参数 & 路径配置（在顶部修改即可）
+# 超参数 & 路径配置
 # ─────────────────────────────────────────────
-DATA_ROOT    = r"C:\Users\weiwu\Desktop\SigPic"        # 只放 5 个类别子文件夹
-OUTPUT_DIR   = r"C:\Users\weiwu\Desktop\SigPic_output" # 输出目录（在 DATA_ROOT 之外！）
+TRAIN_DIR    = r"C:\Users\weiwu\Desktop\SigPic\train"  # 训练集根目录
+TEST_DIR     = r"C:\Users\weiwu\Desktop\SigPic\test"   # 测试集根目录
+OUTPUT_DIR   = r"C:\Users\weiwu\Desktop\SigPic_output" # 输出目录
 MODEL_SAVE   = os.path.join(OUTPUT_DIR, "best_resnet.pth")
 
 NUM_CLASSES  = 5
@@ -36,18 +40,16 @@ BATCH_SIZE   = 32
 NUM_EPOCHS   = 30
 LR           = 1e-4
 WEIGHT_DECAY = 1e-4
-VAL_SPLIT    = 0.15   # 15% 验证集
-TEST_SPLIT   = 0.10   # 10% 测试集
+VAL_SPLIT    = 0.15   # 从 train 中划出 15% 做验证集
 IMG_SIZE     = 224
 SEED         = 42
-NUM_WORKERS  = 0      # Windows 下必须为 0，避免多进程报错
+NUM_WORKERS  = 0      # Windows 下必须为 0
 
 
 # ─────────────────────────────────────────────
-# 辅助：val/test 子集使用不同 transform
+# 辅助：对 Subset 重新应用 transform（val 无增强）
 # ─────────────────────────────────────────────
 class TransformSubset(torch.utils.data.Dataset):
-    """对 random_split 产生的 Subset 重新应用指定 transform。"""
     def __init__(self, subset, transform):
         self.subset    = subset
         self.transform = transform
@@ -71,14 +73,11 @@ def build_model(num_classes: int, backbone: str = "resnet50") -> nn.Module:
     elif backbone == "resnet34":
         model    = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
         feat_dim = 512
-    else:  # resnet50（默认）
+    else:
         model    = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         feat_dim = 2048
 
-    model.fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(feat_dim, num_classes)
-    )
+    model.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(feat_dim, num_classes))
     return model
 
 
@@ -88,7 +87,6 @@ def build_model(num_classes: int, backbone: str = "resnet50") -> nn.Module:
 def run_epoch(model, loader, criterion, optimizer, device, phase="train"):
     is_train = (phase == "train")
     model.train() if is_train else model.eval()
-
     running_loss = running_correct = total = 0
 
     with torch.set_grad_enabled(is_train):
@@ -96,12 +94,10 @@ def run_epoch(model, loader, criterion, optimizer, device, phase="train"):
             imgs, labels = imgs.to(device), labels.to(device)
             outputs = model(imgs)
             loss    = criterion(outputs, labels)
-
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
             running_loss    += loss.item() * imgs.size(0)
             running_correct += (outputs.argmax(1) == labels).sum().item()
             total           += imgs.size(0)
@@ -110,7 +106,7 @@ def run_epoch(model, loader, criterion, optimizer, device, phase="train"):
 
 
 # ─────────────────────────────────────────────
-# 主流程（必须在 __main__ 块内，Windows 多进程要求）
+# 主流程
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
 
@@ -121,65 +117,64 @@ if __name__ == "__main__":
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {DEVICE}")
 
-    # ── 数据增强 ──────────────────────────────
+    # ── Transform ─────────────────────────────
     train_tf = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225]),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     val_tf = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225]),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    # ── 加载数据集 ────────────────────────────
-    full_dataset = datasets.ImageFolder(root=DATA_ROOT, transform=train_tf)
-    CLASS_NAMES  = full_dataset.classes
+    # ── 加载 train / test ─────────────────────
+    full_train = datasets.ImageFolder(root=TRAIN_DIR, transform=train_tf)
+    test_set_raw = datasets.ImageFolder(root=TEST_DIR,  transform=val_tf)
+
+    CLASS_NAMES = full_train.classes
     print(f"检测到类别: {CLASS_NAMES}")
-    counts = np.bincount([s[1] for s in full_dataset.samples])
-    print("各类样本数:", dict(zip(CLASS_NAMES, counts.tolist())))
 
-    # ── 数据集划分 ────────────────────────────
-    n_total = len(full_dataset)
-    n_test  = int(n_total * TEST_SPLIT)
+    train_counts = np.bincount([s[1] for s in full_train.samples])
+    test_counts  = np.bincount([s[1] for s in test_set_raw.samples])
+    print("训练集各类样本数:", dict(zip(CLASS_NAMES, train_counts.tolist())))
+    print("测试集各类样本数:", dict(zip(CLASS_NAMES, test_counts.tolist())))
+
+    # 确保 train/test 类别一致
+    assert full_train.classes == test_set_raw.classes, \
+        "train 和 test 的类别不一致，请检查文件夹结构！"
+
+    # ── 从 train 划出验证集 ───────────────────
+    n_total = len(full_train)
     n_val   = int(n_total * VAL_SPLIT)
-    n_train = n_total - n_val - n_test
+    n_train = n_total - n_val
 
-    train_raw, val_raw, test_raw = random_split(
-        full_dataset, [n_train, n_val, n_test],
+    train_raw, val_raw = random_split(
+        full_train, [n_train, n_val],
         generator=torch.Generator().manual_seed(SEED)
     )
+    val_set = TransformSubset(val_raw, val_tf)   # val 不做增强
 
-    val_set  = TransformSubset(val_raw,  val_tf)
-    test_set = TransformSubset(test_raw, val_tf)
+    print(f"训练集: {len(train_raw)}  验证集: {len(val_set)}  测试集: {len(test_set_raw)}")
 
-    # ── 类别不平衡 → WeightedRandomSampler ───
-    train_labels  = [full_dataset.samples[i][1] for i in train_raw.indices]
+    # ── WeightedRandomSampler（应对类别不平衡）─
+    train_labels  = [full_train.samples[i][1] for i in train_raw.indices]
     class_counts  = np.bincount(train_labels)
     class_weights = 1.0 / class_counts
     sample_w      = [class_weights[l] for l in train_labels]
     sampler       = WeightedRandomSampler(sample_w, len(sample_w), replacement=True)
 
-    train_loader = DataLoader(train_raw, batch_size=BATCH_SIZE,
-                              sampler=sampler,
-                              num_workers=NUM_WORKERS,
-                              pin_memory=(DEVICE.type == "cuda"))
-    val_loader   = DataLoader(val_set,  batch_size=BATCH_SIZE,
-                              shuffle=False,
-                              num_workers=NUM_WORKERS,
-                              pin_memory=(DEVICE.type == "cuda"))
-    test_loader  = DataLoader(test_set, batch_size=BATCH_SIZE,
-                              shuffle=False,
-                              num_workers=NUM_WORKERS,
-                              pin_memory=(DEVICE.type == "cuda"))
-
-    print(f"训练集: {len(train_raw)}  验证集: {len(val_set)}  测试集: {len(test_set)}")
+    pin = (DEVICE.type == "cuda")
+    train_loader = DataLoader(train_raw,     batch_size=BATCH_SIZE, sampler=sampler,
+                              num_workers=NUM_WORKERS, pin_memory=pin)
+    val_loader   = DataLoader(val_set,       batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=pin)
+    test_loader  = DataLoader(test_set_raw,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=pin)
 
     # ── 模型 / 优化器 ─────────────────────────
     model     = build_model(NUM_CLASSES, backbone="resnet50").to(DEVICE)
@@ -253,7 +248,7 @@ if __name__ == "__main__":
     plt.close()
     print(f"\nLoss/Acc 曲线已保存: {loss_fig_path}")
 
-    # ── 测试集评估 & 混淆矩阵 ─────────────────
+    # ── 测试集评估 & 混淆矩阵（概率）────────────
     model.load_state_dict(best_weights)
     model.eval()
 
@@ -268,13 +263,11 @@ if __name__ == "__main__":
     print("\n测试集分类报告:")
     print(classification_report(all_labels, all_preds, target_names=CLASS_NAMES))
 
-    cm = confusion_matrix(all_labels, all_preds)
-    # 按行归一化（每行 = 该真实类别的预测概率分布）
+    cm      = confusion_matrix(all_labels, all_preds)
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-    # 每格显示：概率% + 原始数量
-    annot = np.array([[f"{cm_norm[i,j]*100:.1f}%\n({cm[i,j]})"
-                       for j in range(cm.shape[1])]
-                      for i in range(cm.shape[0])])
+    annot   = np.array([[f"{cm_norm[i,j]*100:.1f}%\n({cm[i,j]})"
+                         for j in range(cm.shape[1])]
+                        for i in range(cm.shape[0])])
     fig, ax = plt.subplots(figsize=(8, 6))
     sns.heatmap(cm_norm, annot=annot, fmt="", cmap="Blues",
                 xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
@@ -288,7 +281,7 @@ if __name__ == "__main__":
     plt.close()
     print(f"混淆矩阵已保存: {cm_path}")
 
-    # ── t-SNE 特征可视化 ──────────────────────
+    # ── t-SNE 特征可视化（使用完整测试集）───────
     print("\n提取特征向量用于 t-SNE（使用测试集）...")
     feature_extractor = nn.Sequential(*list(model.children())[:-1])
     feature_extractor = feature_extractor.to(DEVICE).eval()
@@ -304,7 +297,6 @@ if __name__ == "__main__":
     feats     = np.concatenate(feats_list, axis=0)
     labels_np = np.array(labels_list)
 
-    # perplexity 不能超过样本数，自动修正
     perplexity = min(30, len(feats) - 1)
     print(f"特征矩阵形状: {feats.shape}  perplexity={perplexity}  开始 t-SNE 降维...")
     tsne     = TSNE(n_components=2, perplexity=perplexity, max_iter=1000,
