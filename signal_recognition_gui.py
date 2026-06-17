@@ -41,53 +41,14 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 
-def _setup_matplotlib_fonts():
-    """配置中文字体，消除 CJK 字形缺失告警。"""
-    from matplotlib import font_manager
-
-    candidates = [
-        "Microsoft YaHei",
-        "SimHei",
-        "Microsoft JhengHei",
-        "PingFang SC",
-        "Noto Sans CJK SC",
-        "Source Han Sans SC",
-        "WenQuanYi Micro Hei",
-    ]
-    available = {f.name for f in font_manager.fontManager.ttflist}
-
-    chosen = None
-    for c in candidates:
-        if c in available:
-            chosen = c
-            break
-    if chosen is None:
-        chosen = "DejaVu Sans"   # fallback（不含中文）
-
-    matplotlib.rcParams["font.family"] = "sans-serif"
-    matplotlib.rcParams["font.sans-serif"] = [chosen, "DejaVu Sans"]
-    matplotlib.rcParams["axes.unicode_minus"] = False
-
-    # 强制字体缓存刷新（确保新装中文字体被识别）
+def _fill_axes(fig, left=0.08, right=0.985, top=0.88, bottom=0.20):
+    """让 axes 撑满整个 figure（留出标签边距）。
+    比 constrained_layout 在 Qt 后端更稳定地填满画布、随窗口伸缩。
+    """
     try:
-        font_manager._load_fontmanager(try_read_cache=False)
+        fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
     except Exception:
         pass
-
-    return chosen
-
-_CJK_FONT = _setup_matplotlib_fonts()
-
-
-def _set_constrained(fig):
-    """启用 constrained 布局，兼容新旧 matplotlib。"""
-    try:
-        fig.set_layout_engine("constrained")        # matplotlib >= 3.6
-    except (AttributeError, ValueError):
-        try:
-            fig.set_constrained_layout(True)         # 旧版本
-        except Exception:
-            pass
 
 # ─────────────────────────────────────────────
 # 尝试复用用户已有脚本（同目录）
@@ -95,148 +56,17 @@ def _set_constrained(fig):
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
-_BACKEND = "builtin"
-try:
-    import signal_tfmap_generator as STG          # 复用解析 + STFT
-    # 触发插件加载（注册 .iqh）
-    if hasattr(STG, "_load_plugins"):
-        try:
-            STG._load_plugins()
-        except Exception:
-            pass
-    detect_format       = STG.detect_format
-    generate_spectrogram = STG.generate_spectrogram
-    auto_nfft           = STG.auto_nfft
-    IQMeta              = STG.IQMeta
-    _BACKEND = "signal_tfmap_generator"
-except Exception:
-    STG = None  # 下方使用内置实现
-
-
-# ═════════════════════════════════════════════
-# 内置等价实现（仅当未找到 signal_tfmap_generator 时启用）
-# ═════════════════════════════════════════════
-if STG is None:
-    import xml.etree.ElementTree as ET
-    import dataclasses
-
-    @dataclasses.dataclass
-    class IQMeta:
-        sample_rate: float
-        center_freq: float
-        sample_count: int
-        data_type: str
-        iq_file_path: str
-        scale_factor: float = 1.0
-        extra: dict = dataclasses.field(default_factory=dict)
-
-        @property
-        def duration_s(self):
-            return self.sample_count / self.sample_rate
-
-        @property
-        def samples_per_10ms(self):
-            return int(self.sample_rate * 0.01)
-
-    class _BaseParser:
-        @staticmethod
-        def _resolve(iq_path, search_dirs):
-            if os.path.isfile(iq_path):
-                return iq_path
-            fn = os.path.basename(iq_path.replace("\\", "/"))
-            for d in (search_dirs or []):
-                c = os.path.join(d, fn)
-                if os.path.isfile(c):
-                    return c
-            raise FileNotFoundError(f"IQ 文件未找到: {iq_path}")
-
-    class _SignalHoundParser(_BaseParser):
-        _DTYPE = {"complex short": (np.int16, 2), "complex float": (np.float32, 4)}
-
-        def parse(self, p):
-            root = ET.parse(p).getroot()
-            g = lambda t, c=str: c(root.find(t).text.strip())
-            return IQMeta(g("SampleRate", float), g("CenterFrequency", float),
-                          g("SampleCount", int), g("DataType"), g("IQFileName"),
-                          g("ScaleFactor", float) if root.find("ScaleFactor") is not None else 1.0)
-
-        def read_samples(self, meta, start, num, dirs=None):
-            path = self._resolve(meta.iq_file_path, dirs)
-            dt, bpc = self._DTYPE[meta.data_type.lower()]
-            bps = bpc * 2
-            with open(path, "rb") as f:
-                f.seek(start * bps)
-                raw = np.frombuffer(f.read(num * bps), dtype=dt)
-            iq = raw[0::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)
-            if meta.data_type.lower() == "complex short":
-                iq /= 32768.0
-            return iq
-
-    class _IQHBParser(_BaseParser):
-        _FMT = {"iq_int8": (np.int8, 1, 128.0), "iq_int16": (np.int16, 2, 32768.0),
-                "iq_single": (np.float32, 4, 1.0)}
-
-        def parse(self, p):
-            p = os.path.normpath(p)
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                lines = [l.strip() for l in f if l.strip()]
-            fld = {}
-            for l in lines[1:]:
-                if ":" in l:
-                    k, _, v = l.partition(":")
-                    fld[k.strip()] = v.strip()
-            stem = Path(p).stem
-            iqb = str(Path(p).parent / (stem + ".iqb"))
-            return IQMeta(float(fld["SampleRate"]), float(fld["CenterFrequency"]),
-                          int(fld["NumberSamples"]), fld["NumberFormat"], iqb,
-                          float(fld.get("Scale", 1.0)))
-
-        def read_samples(self, meta, start, num, dirs=None):
-            dirs = list(dirs or []) + [str(Path(meta.iq_file_path).parent)]
-            path = self._resolve(meta.iq_file_path, dirs)
-            key = meta.data_type.lower().replace("-", "_")
-            dt, bpc, denom = self._FMT[key]
-            bps = bpc * 2
-            with open(path, "rb") as f:
-                f.seek(start * bps)
-                raw = np.frombuffer(f.read(num * bps), dtype=dt)
-            n = len(raw) // 2
-            I = raw[0::2][:n].astype(np.float32)
-            Q = raw[1::2][:n].astype(np.float32)
-            scale = meta.scale_factor / denom if denom != 1.0 else meta.scale_factor
-            return (I + 1j * Q).astype(np.complex64) * scale
-
-    def detect_format(meta_path):
-        ext = Path(meta_path).suffix.lower()
-        if ext == ".xml":
-            return _SignalHoundParser()
-        if ext == ".iqh":
-            return _IQHBParser()
-        raise ValueError(f"无法识别格式: {meta_path}")
-
-    def auto_nfft(fs):
-        target = fs * 0.05 / 1000.0
-        n = 1
-        while n < target:
-            n <<= 1
-        return max(64, min(2048, n))
-
-    def generate_spectrogram(iq, fs, nfft=256, overlap=0.75, window="hann"):
-        hop = max(1, int(nfft * (1 - overlap)))
-        win = np.hanning(nfft)
-        n_frames = (len(iq) - nfft) // hop + 1
-        if n_frames <= 0:
-            raise ValueError("样本不足一帧")
-        spec = np.zeros((nfft, n_frames), dtype=np.float32)
-        for i in range(n_frames):
-            seg = iq[i * hop:i * hop + nfft] * win
-            spectrum = np.fft.fftshift(np.fft.fft(seg, n=nfft))
-            spec[:, i] = np.abs(spectrum) ** 2
-        power_db = 10 * np.log10(spec + 1e-12)
-        f_axis = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / fs))
-        t_axis = np.arange(n_frames) * hop / fs
-        return t_axis, f_axis, power_db
-
+import signal_tfmap_generator as STG          # 复用解析 + STFT
+if hasattr(STG, "_load_plugins"):
+    try:
+        STG._load_plugins()
+    except Exception:
+        pass
+detect_format       = STG.detect_format
+generate_spectrogram = STG.generate_spectrogram
+auto_nfft           = STG.auto_nfft
+IQMeta              = STG.IQMeta
+_BACKEND = "signal_tfmap_generator"
 
 # ═════════════════════════════════════════════
 # 类别定义
@@ -432,20 +262,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.log("未检测到 PyTorch，导入模型前请先 pip install torch torchvision", "warn")
 
-    # ── 窗口尺寸变化：让 Qt 控制 figure 尺寸，matplotlib 只负责画 ──
-    def resizeEvent(self, event):
-        # 用画布实际像素 / dpi 反算 figure 英寸，使渲染缓冲始终匹配
-        # 控件物理像素 —— 既清晰又不溢出。dpi 不固定，跟随各 figure 自身。
-        for fig, canvas in ((getattr(self, "figSpec", None), getattr(self, "canvasSpec", None)),
-                            (getattr(self, "figTF", None),   getattr(self, "canvasTF", None))):
-            if fig is None or canvas is None:
-                continue
-            dpi = fig.dpi
-            w = max(1, canvas.width())
-            h = max(1, canvas.height())
-            fig.set_size_inches(w / dpi, h / dpi, forward=False)
-        super().resizeEvent(event)
-
     # ── 构建界面 ──
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -582,25 +398,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         _EXPAND = QtWidgets.QSizePolicy.Policy.Expanding
 
-        # 频谱图：尺寸由 Qt 控制，constrained_layout 自动排布；
-        # 高 DPI 提升位图清晰度（不改变显示尺寸）
+        # 频谱图：尺寸由 Qt 后端自动同步到画布；axes 用固定边距撑满 figure
         self.figSpec = Figure(facecolor=C_BG)
-        _set_constrained(self.figSpec)
         self.canvasSpec = FigureCanvas(self.figSpec)
         self.canvasSpec.setMinimumHeight(150)
         self.canvasSpec.setSizePolicy(_EXPAND, _EXPAND)
         self.axSpec = self.figSpec.add_subplot(111)
         self._style_ax(self.axSpec, "SPECTRUM 频谱")
+        _fill_axes(self.figSpec)
         il.addWidget(self.canvasSpec, 2)   # 频谱占 2 份高度
 
         # 时频图
         self.figTF = Figure(facecolor=C_BG)
-        _set_constrained(self.figTF)
         self.canvasTF = FigureCanvas(self.figTF)
         self.canvasTF.setMinimumHeight(200)
         self.canvasTF.setSizePolicy(_EXPAND, _EXPAND)
         self.axTF = self.figTF.add_subplot(111)
         self._style_ax(self.axTF, "SPECTROGRAM 时频图 · 10 ms")
+        _fill_axes(self.figTF)
         il.addWidget(self.canvasTF, 3)     # 时频图占 3 份高度
 
         # 按键（固定高度，不抢占画布空间）
@@ -670,7 +485,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.set_color(C_LINE)
         ax.tick_params(colors=C_TXTDIM, labelsize=7)
         ax.set_title(title, color=C_PHOS, fontsize=8, loc="left", pad=4,
-                     fontfamily="monospace")
+                     fontfamily="Microsoft YaHei")
         ax.grid(True, color=C_GRID, alpha=0.5, linewidth=0.5)
 
     # ════════════ 业务逻辑 ════════════
